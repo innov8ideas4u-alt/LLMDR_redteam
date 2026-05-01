@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+
+# Local audit log artifacts
+*.jsonl
+door_blacklist_current.json
+door_blacklist_current.json.gen
+.llmdr_redteam/

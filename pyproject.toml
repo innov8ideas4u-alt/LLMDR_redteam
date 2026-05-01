@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llmdr-redteam"
+version = "0.1.0"
+description = "LLMDR Red Team — adversarial mission catalog for Flipper-compatible devices, with single-write audit log + interpreter layer"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Victor", email = "info@edgecalgary.org"},
+]
+keywords = ["flipper", "kiisu", "mcp", "llm", "redteam", "rfid", "nfc", "subghz"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: System :: Hardware",
+]
+
+# Same dependency story as LLMDR_app — built on top of flipper-mcp.
+# Editable install from sibling repo during dev:
+#   pip install -e ../flippermcp
+#   pip install -e .
+dependencies = [
+    "flipper-mcp",
+    "mcp>=1.0",
+    "uuid6>=2024.7.10",   # uuid7 for time-sortable event ids
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.21",
+]
+
+[project.urls]
+Homepage = "https://github.com/innov8ideas4u-alt/LLMDR_redteam"
+Repository = "https://github.com/innov8ideas4u-alt/LLMDR_redteam"
+"flipper-mcp library" = "https://github.com/innov8ideas4u-alt/flippermcp"
+
+[project.scripts]
+llmdr-redteam = "llmdr_redteam.cli:main"
+
+# Auto-registration into flipper-mcp's module registry. Same pattern as LLMDR_app.
+[project.entry-points."flipper_mcp.modules"]
+llmdr_redteam_missions = "llmdr_redteam.missions:RedteamMissionModule"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
