@@ -47,6 +47,35 @@ Page 0: 04 39 91 24
 Page 1: C2 FC 67 80
 """
 
+# Captured live 2026-05-01 from a Mifare Ultralight 11 — Version 4 format.
+# DIFFERENT shape from Version 2:
+#   - Has '# comment' lines that must be skipped
+#   - 'Device type' is the family ('NTAG/Ultralight'), not the variant
+#   - 'NTAG/Ultralight type' is the precise variant ('Mifare Ultralight 11')
+#   - ATQA appears in spec order ('00 44'), opposite to v2's wire order
+# Fixture used to lock in the v4 parser path.
+REAL_UL11_V4_FIXTURE = """\
+Filetype: Flipper NFC device
+Version: 4
+# Device type can be ISO14443-3A, ISO14443-3B, ISO14443-4A, ISO14443-4B, ISO15693-3, FeliCa, NTAG/Ultralight, Mifare Classic, Mifare Plus, Mifare DESFire, SLIX, ST25TB, NTAG4xx, Type 4 Tag, EMV
+Device type: NTAG/Ultralight
+# UID is common for all formats
+UID: 04 6D D7 0A 48 20 90
+# ISO14443-3A specific data
+ATQA: 00 44
+SAK: 00
+# NTAG/Ultralight specific data
+Data format version: 2
+NTAG/Ultralight type: Mifare Ultralight 11
+Signature: 28 54 3D 10 F6 9A D6 D3 9C A9 FE 26 70 78 BE C2 EF 94 A9 9C B4 98 D3 A0 E0 94 F4 F0 C5 6F FE 0B
+Mifare version: 00 04 03 01 01 00 0B 03
+Pages total: 20
+Pages read: 16
+Page 0: 04 6D D7 36
+Page 1: 0A 48 20 90
+Page 16: 00 00 00 10
+"""
+
 CLASSIC_1K_FIXTURE = """\
 Filetype: Flipper NFC device
 Version: 4
@@ -235,3 +264,63 @@ def test_atqa_normalize_does_not_swap_when_both_bytes_nonzero():
 
     # Both non-zero: leave as-is (operator's table value should match)
     assert _normalize_atqa("03 44") == "0344"
+
+
+# ---------- Format Version 4 (the live Day 4 Part B fixture) ------------
+
+def test_v4_parser_extracts_subtype():
+    """Version 4 .nfc files have a 'NTAG/Ultralight type' field that gives
+    the EXACT variant. The parser must extract it as `subtype`."""
+    card = parse_nfc_file(REAL_UL11_V4_FIXTURE)
+    assert card.uid == "04 6D D7 0A 48 20 90"
+    assert card.atqa == "00 44"   # spec order in v4
+    assert card.sak == "00"
+    assert card.device_type == "NTAG/Ultralight"
+    assert card.subtype == "Mifare Ultralight 11"
+    assert card.file_format_version == "4"
+
+
+def test_v4_subtype_overrides_atqa_classification():
+    """When subtype is available, it should win over the ATQA/SAK
+    family lookup. Both an Ultralight 11 and an NTAG216 share the
+    0x0044/0x00 signature, but subtype tells them apart."""
+    card = parse_nfc_file(REAL_UL11_V4_FIXTURE)
+    # Subtype is 'Mifare Ultralight 11' -> tentative_id 'mifare_ultralight_11'
+    # NOT the generic 'mifare_ultralight_or_ntag21x'
+    assert card.tentative_id() == "mifare_ultralight_11"
+
+
+def test_v4_comment_lines_are_skipped():
+    """Version 4 files include '# comment lines'. The parser must NOT
+    treat them as keys."""
+    # Comment lines do mention 'Device type', but those have no ': value'
+    # AFTER the colon (the colon is part of the description). The parser
+    # should still find the real 'Device type:' line below.
+    card = parse_nfc_file(REAL_UL11_V4_FIXTURE)
+    assert card.device_type == "NTAG/Ultralight"  # not the comment text
+
+
+def test_v2_subtype_is_none_falls_back_to_atqa_lookup():
+    """Version 2 files don't have a subtype field. tentative_id should
+    fall back to the ATQA/SAK family table."""
+    card = parse_nfc_file(REAL_NTAG216_FIXTURE)
+    assert card.subtype is None
+    # Falls back: ATQA 44 00 (wire) + SAK 00 -> mifare_ultralight_or_ntag21x
+    assert card.tentative_id() == "mifare_ultralight_or_ntag21x"
+
+
+def test_unknown_subtype_falls_back_to_atqa_lookup():
+    """If a file has a subtype we don't recognize, fall back to ATQA/SAK
+    rather than returning None — the family-level answer is still useful."""
+    fixture = (
+        "Version: 4\n"
+        "Device type: NTAG/Ultralight\n"
+        "UID: 04 11 22 33 44 55 66\n"
+        "ATQA: 00 44\n"
+        "SAK: 00\n"
+        "NTAG/Ultralight type: Mifare Ultralight Future Variant 99\n"
+    )
+    card = parse_nfc_file(fixture)
+    assert card.subtype == "Mifare Ultralight Future Variant 99"
+    # Unknown subtype -> tentative_id falls back to the ATQA/SAK table
+    assert card.tentative_id() == "mifare_ultralight_or_ntag21x"

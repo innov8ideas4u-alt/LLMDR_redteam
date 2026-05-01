@@ -85,19 +85,65 @@ def _normalize_atqa(s: str) -> str:
 
 @dataclass
 class NFCCardData:
-    """Parsed contents of a .nfc file. Best-effort — fields may be empty."""
+    """Parsed contents of a .nfc file. Best-effort — fields may be empty.
+
+    The Flipper firmware ships several format versions (Version 2 and Version 4
+    are common as of 2026). Field availability varies:
+      - Version 2: 'Device type' is specific (e.g. 'NTAG216'), ATQA in wire order.
+      - Version 4: 'Device type' is a category ('NTAG/Ultralight'), with a
+        secondary 'NTAG/Ultralight type' giving the exact variant. ATQA may
+        appear in spec order. Adds '# comment lines' that we skip.
+
+    `subtype` carries the v4 subtype field when present, so e.g. an Ultralight
+    11 vs an NTAG216 can be told apart even though both classify as
+    'mifare_ultralight_or_ntag21x' from ATQA/SAK alone.
+    """
     uid: Optional[str] = None
     atqa: Optional[str] = None
     sak: Optional[str] = None
-    device_type: Optional[str] = None     # firmware's own family label
+    device_type: Optional[str] = None     # firmware's primary family label
+    subtype: Optional[str] = None         # firmware's subtype label (v4+)
+    file_format_version: Optional[str] = None  # the .nfc file's own version
     raw_text: str = ""
     source_path: Optional[str] = None     # /ext/nfc/<filename>
 
     def tentative_id(self) -> Optional[str]:
+        """Map ATQA/SAK + subtype to a canonical tentative_id.
+
+        When the subtype field is populated (Version 4 files), use it for a
+        more specific id. Falls back to the ATQA/SAK family when subtype
+        isn't available.
+        """
+        # If we have a subtype, prefer it — it's more specific than the
+        # ATQA/SAK pairing alone.
+        if self.subtype:
+            mapped = _SUBTYPE_TO_TENTATIVE_ID.get(self.subtype.lower().strip())
+            if mapped:
+                return mapped
         if not self.atqa or not self.sak:
             return None
         key = (_normalize_atqa(self.atqa), _normalize_short_hex(self.sak))
         return ATQA_SAK_FAMILY.get(key)
+
+
+# ---------- subtype -> tentative_id (more specific than ATQA/SAK) -------
+# Populated by Version 4 .nfc files in the 'NTAG/Ultralight type' field
+# (and similar fields for other families). Mappings keyed on lowercased
+# subtype string.
+
+_SUBTYPE_TO_TENTATIVE_ID: dict[str, str] = {
+    "mifare ultralight":     "mifare_ultralight",
+    "mifare ultralight 11":  "mifare_ultralight_11",
+    "mifare ultralight 21":  "mifare_ultralight_21",
+    "mifare ultralight c":   "mifare_ultralight_c",
+    "mifare ultralight ev1": "mifare_ultralight_ev1",
+    "ntag203":               "ntag203",
+    "ntag210":               "ntag210",
+    "ntag212":               "ntag212",
+    "ntag213":               "ntag213",
+    "ntag215":               "ntag215",
+    "ntag216":               "ntag216",
+}
 
 
 def parse_nfc_file(text: str, source_path: Optional[str] = None) -> NFCCardData:
@@ -108,9 +154,15 @@ def parse_nfc_file(text: str, source_path: Optional[str] = None) -> NFCCardData:
     canonicalizer downstream — here we keep the firmware's own formatting in
     `raw_text` and pass the UID through as-given so canonicalize_cross_link
     handles the normalization in one place (per the schema rule).
+
+    Handles file format versions 2 and 4 transparently. Comment lines
+    starting with '#' are skipped explicitly.
     """
     data = NFCCardData(raw_text=text, source_path=source_path)
     for line in text.splitlines():
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
         if ":" not in line:
             continue
         key, _, value = line.partition(":")
@@ -118,7 +170,10 @@ def parse_nfc_file(text: str, source_path: Optional[str] = None) -> NFCCardData:
         value = value.strip()
         if not value:
             continue
-        if key == "uid":
+        if key == "version":
+            # The .nfc FILE format version (2, 4, ...), not the firmware version
+            data.file_format_version = value
+        elif key == "uid":
             data.uid = value
         elif key == "atqa":
             data.atqa = value
@@ -126,6 +181,12 @@ def parse_nfc_file(text: str, source_path: Optional[str] = None) -> NFCCardData:
             data.sak = value
         elif key == "device type":
             data.device_type = value
+        elif key in (
+            "ntag/ultralight type",   # v4 NTAG/Ultralight subtype
+            "mifare classic type",    # v4 Mifare Classic subtype (1K vs 4K vs Plus)
+            "mifare desfire type",    # v4 DESFire subtype (EV1 vs EV2 vs EV3)
+        ):
+            data.subtype = value
     return data
 
 
@@ -167,28 +228,33 @@ class RealNFCBackend:
         before = await self._list_nfc_files()
         log.debug("nfc backend: %d existing .nfc files before scan", len(before))
 
+        # Try to launch the NFC app. If something else is already running,
+        # the firmware will refuse — that's fine; we still watch the
+        # directory and trust the operator to navigate to NFC -> Read
+        # manually. Either path produces a new .nfc file.
         launched_via = await self._launch_nfc_app()
-        if not launched_via:
-            return Detection(
-                sensor="nfc", detected=False, confidence="low",
-                notes=(
-                    "Could not launch the NFC app on the Kiisu. Open NFC → "
-                    "Read manually, tap the card, save it, and re-run."
-                ),
+        if launched_via:
+            log.info("nfc backend: NFC app launched via app_start(%r), "
+                     "watching %s for %.1fs", launched_via, self.nfc_dir,
+                     self.timeout_s)
+            launch_note = f"Launched NFC app via app_start({launched_via!r})."
+        else:
+            log.info("nfc backend: app_start refused (likely another app open) — "
+                     "watching %s for %.1fs anyway", self.nfc_dir, self.timeout_s)
+            launch_note = (
+                "Could not launch NFC app remotely (another app likely already open "
+                "on the Kiisu, or unrecognized name). Open NFC → Read manually "
+                "on the device, tap the card, save it."
             )
-
-        log.info("nfc backend: NFC app launched via app_start(%r), "
-                 "watching %s for %.1fs", launched_via, self.nfc_dir,
-                 self.timeout_s)
 
         new_files = await self._wait_for_new_file(before)
         if not new_files:
             return Detection(
                 sensor="nfc", detected=False, confidence="medium",
                 notes=(
-                    f"NFC app open for {int(self.timeout_s)}s, no new file "
-                    f"appeared in {self.nfc_dir}. Card not tapped, or not "
-                    f"saved, or the firmware wrote elsewhere."
+                    f"{launch_note} Watched {self.nfc_dir} for "
+                    f"{int(self.timeout_s)}s, no new file appeared. "
+                    "Card not tapped, not saved, or firmware wrote elsewhere."
                 ),
             )
 
@@ -229,6 +295,8 @@ class RealNFCBackend:
                 "atqa": card.atqa,
                 "sak": card.sak,
                 "device_type": card.device_type,
+                "subtype": card.subtype,
+                "file_format_version": card.file_format_version,
                 "source_path": full_path,
             },
             tentative_id=tentative,
@@ -237,6 +305,7 @@ class RealNFCBackend:
                 f"Saved by Kiisu firmware to {full_path}"
                 + (f"; firmware labelled it {card.device_type!r}"
                    if card.device_type else "")
+                + (f" (subtype: {card.subtype!r})" if card.subtype else "")
             ),
         )
 
@@ -264,8 +333,21 @@ class RealNFCBackend:
 
     async def _launch_nfc_app(self) -> Optional[str]:
         """Try common app names for the Kiisu NFC reader. Returns the name
-        that worked, or None."""
-        for app_name in ("NFC", "nfc", "Nfc"):
+        that worked, or None.
+
+        Tried in order, most-likely-to-work first per Day-4 hardware findings.
+        Stock OFW responds to bare 'NFC'. Momentum builds sometimes need
+        the full .fap path. The dev who finds a NEW name that works should
+        add it here.
+        """
+        candidates = (
+            "NFC",                          # stock OFW
+            "nfc",                          # case variant
+            "Nfc",                          # case variant
+            "/ext/apps/NFC/nfc.fap",        # Momentum path-based launch
+            "nfc.fap",                      # Momentum bare-fap launch
+        )
+        for app_name in candidates:
             try:
                 if await self.flipper.rpc.app_start(app_name, ""):
                     return app_name
