@@ -23,8 +23,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .sensor_backends import Detection
@@ -97,6 +98,10 @@ class NFCCardData:
     `subtype` carries the v4 subtype field when present, so e.g. an Ultralight
     11 vs an NTAG216 can be told apart even though both classify as
     'mifare_ultralight_or_ntag21x' from ATQA/SAK alone.
+
+    `system_fingerprint` carries the auto-detected vendor / system identifier
+    (e.g. 'vingcard_visionline_likely', 'ntag_blank', 'rickroll_ndef') with
+    a 1-5 security score. Populated by detect_card_system() during parsing.
     """
     uid: Optional[str] = None
     atqa: Optional[str] = None
@@ -104,8 +109,16 @@ class NFCCardData:
     device_type: Optional[str] = None     # firmware's primary family label
     subtype: Optional[str] = None         # firmware's subtype label (v4+)
     file_format_version: Optional[str] = None  # the .nfc file's own version
+    mifare_version: Optional[str] = None  # GET_VERSION block, if present
+    otp: Optional[str] = None             # page 3 (OTP) bytes
+    pages: dict[int, str] = field(default_factory=dict)  # page_num -> hex string
     raw_text: str = ""
     source_path: Optional[str] = None     # /ext/nfc/<filename>
+
+    # Populated by detect_card_system() — see below
+    system_fingerprint: Optional[str] = None  # e.g. 'vingcard_visionline_likely'
+    security_score: Optional[int] = None      # 1-5 per the security scale
+    fingerprint_evidence: list[str] = field(default_factory=list)  # human-readable why
 
     def tentative_id(self) -> Optional[str]:
         """Map ATQA/SAK + subtype to a canonical tentative_id.
@@ -146,6 +159,220 @@ _SUBTYPE_TO_TENTATIVE_ID: dict[str, str] = {
 }
 
 
+# ---------- entropy helper for fingerprint ------------------------------
+
+def _shannon_entropy(byte_data: bytes) -> float:
+    """Shannon entropy in bits/byte. ~0 = constant, ~8 = random.
+    ASCII text typically 3.5-4.5, encrypted/compressed data 5.5-8.0."""
+    if not byte_data:
+        return 0.0
+    counts = {}
+    for b in byte_data:
+        counts[b] = counts.get(b, 0) + 1
+    total = len(byte_data)
+    return -sum((c / total) * math.log2(c / total) for c in counts.values())
+
+
+def _hex_to_bytes(s: str) -> bytes:
+    """Strip separators, parse hex pairs. Returns empty bytes on any failure."""
+    cleaned = re.sub(r"[^0-9a-fA-F]", "", s or "")
+    if len(cleaned) % 2 != 0:
+        cleaned = cleaned[:-1]
+    try:
+        return bytes.fromhex(cleaned)
+    except ValueError:
+        return b""
+
+
+# ---------- system fingerprint signatures -------------------------------
+# Each fingerprint is a callable that takes NFCCardData and returns either
+# (fingerprint_id, security_score, evidence_lines) or None. The first one
+# that fires wins. Order them most-specific-first.
+#
+# Add new signatures as new card systems are encountered in the field.
+# Document each one in interpreter/knowledge/<vendor>.md so the interpreter
+# can produce a rich narrative.
+
+_VINGCARD_UL_VERSION = "00 04 03 01 01 00 0B 03"  # spaces preserved
+
+
+def _fp_vingcard_ul_ev1(data: NFCCardData) -> Optional[tuple[str, int, list[str]]]:
+    """VingCard / ASSA ABLOY Hospitality UL EV1 hospitality keycard.
+
+    See knowledge/vingcard.md for full documentation. Detection requires
+    3+ markers: chip family + AUTH0 pattern + OTP non-zero + high-entropy
+    payload pages.
+    """
+    evidence: list[str] = []
+
+    # 1. Must be Ultralight family (ATQA 0x0044, SAK 0x00)
+    if not data.atqa or not data.sak:
+        return None
+    if _normalize_atqa(data.atqa) != "0044" or _normalize_short_hex(data.sak) != "00":
+        return None
+    evidence.append("ATQA 0x0044 / SAK 0x00 (Ultralight family)")
+
+    # 2. Mifare version block matches UL EV1 UL11 (MF0UL1101)
+    mv = (data.mifare_version or "").replace(" ", "").lower()
+    expected_mv = _VINGCARD_UL_VERSION.replace(" ", "").lower()
+    if mv == expected_mv:
+        evidence.append(f"Mifare version block = {_VINGCARD_UL_VERSION} (UL EV1 / UL11)")
+    else:
+        # Not a UL11. VingCard uses larger ULs sometimes but UL11 is the
+        # signal we're using. Without it, we don't fire.
+        return None
+
+    # 3. AUTH0 marker — page 16 byte 4 indicates pwd-protect-from boundary.
+    # On VingCard System C we typically see AUTH0 = 0x10 (pages 16+ pwd-protected).
+    page16 = _hex_to_bytes(data.pages.get(16, ""))
+    auth0 = page16[3] if len(page16) >= 4 else None
+    if auth0 is not None and 0x04 <= auth0 <= 0x10:
+        evidence.append(f"AUTH0 = 0x{auth0:02x} on page 16 (pwd-protect boundary, "
+                        f"VingCard typical)")
+    elif auth0 is not None and auth0 == 0xFF:
+        # 0xFF = no pages pwd-protected; not a hospitality config
+        return None
+
+    # 4. OTP non-zero (page 3) — VingCard writes a property identifier here.
+    otp_bytes = _hex_to_bytes(data.otp or "")
+    if otp_bytes and any(b != 0 for b in otp_bytes):
+        evidence.append(f"OTP non-zero ({data.otp}) — property identifier or system marker")
+    else:
+        # OTP empty/zero on UL11 is more consistent with a blank chip
+        return None
+
+    # 5. High-entropy payload in pages 4-15 — encrypted credential.
+    payload_bytes = b""
+    for p in range(4, 16):
+        payload_bytes += _hex_to_bytes(data.pages.get(p, ""))
+    if len(payload_bytes) < 16:  # less than 4 pages worth of data
+        return None
+    entropy = _shannon_entropy(payload_bytes)
+    if entropy < 3.5:
+        # Low entropy = ASCII text, NDEF, or zeros — not VingCard
+        return None
+    evidence.append(f"Payload entropy {entropy:.2f} bits/byte across {len(payload_bytes)}"
+                    f" payload bytes (encrypted credential)")
+
+    # All five markers fired. High confidence.
+    return ("vingcard_visionline_likely", 3, evidence)
+
+
+def _fp_ndef_url(data: NFCCardData) -> Optional[tuple[str, int, list[str]]]:
+    """NDEF URL record on an Ultralight/NTAG. Common for marketing tags,
+    Rickrolls, Amiibo metadata wrappers.
+
+    Detection strategy: look for the NDEF "magic" anywhere in pages 3-12:
+      - CC at page 3 with byte 0 = 0xE1 (NDEF capability container marker), OR
+      - TLV start (0x03) followed by length and NDEF record header (0xD1)
+        anywhere in the early-page bytes.
+    Then look for a URI record (0x55) and decode the prefix + ASCII tail.
+    """
+    if not data.atqa or _normalize_atqa(data.atqa) != "0044":
+        return None
+
+    # Concatenate pages 3..12 — that's where NDEF lives on UL/NTAG
+    blob = b""
+    for p in range(3, 13):
+        blob += _hex_to_bytes(data.pages.get(p, ""))
+    if len(blob) < 8:
+        return None
+
+    # Marker 1: CC magic at page 3 byte 0 (0xE1 = "NDEF supported")
+    cc_ndef = blob[0] == 0xE1
+    # Marker 2: NDEF TLV (0x03 LL D1 ...) anywhere in the blob
+    tlv_idx = -1
+    for i in range(len(blob) - 2):
+        if blob[i] == 0x03 and blob[i + 2] == 0xD1:
+            tlv_idx = i
+            break
+
+    if not cc_ndef and tlv_idx < 0:
+        return None
+
+    # Look for a URI record (record type byte 0x55 = 'U')
+    uri_idx = blob.find(b"\x55", max(0, tlv_idx))
+    if uri_idx < 0 or uri_idx + 2 >= len(blob):
+        return None
+
+    # Byte after 0x55 is the URI prefix code per NDEF URI record spec:
+    prefix_code = blob[uri_idx + 1]
+    prefix_map = {
+        0x00: "",          0x01: "http://www.",  0x02: "https://www.",
+        0x03: "http://",   0x04: "https://",     0x05: "tel:",
+        0x06: "mailto:",
+    }
+    prefix = prefix_map.get(prefix_code, f"<prefix 0x{prefix_code:02x}>")
+
+    # ASCII tail until 0xFE (TLV terminator) or 0x00
+    tail_bytes = blob[uri_idx + 2:]
+    end = len(tail_bytes)
+    for i, b in enumerate(tail_bytes):
+        if b in (0x00, 0xFE):
+            end = i
+            break
+    ascii_tail = tail_bytes[:end].decode("ascii", errors="replace")
+    if not ascii_tail:
+        return None
+
+    full_url = prefix + ascii_tail
+    evidence = [
+        f"NDEF marker found"
+        + (" (CC E1 at page 3)" if cc_ndef else "")
+        + (f" (TLV 0x03 at offset {tlv_idx})" if tlv_idx >= 0 else ""),
+        f"NDEF URI record decoded: {full_url!r}",
+    ]
+    return ("ntag_ndef_url", 1, evidence)
+
+
+def _fp_blank_ultralight(data: NFCCardData) -> Optional[tuple[str, int, list[str]]]:
+    """Factory-blank Ultralight/NTAG — pages 4-15 all zero, OTP zero."""
+    if not data.atqa or _normalize_atqa(data.atqa) != "0044":
+        return None
+    payload = b""
+    for p in range(4, 16):
+        payload += _hex_to_bytes(data.pages.get(p, ""))
+    if not payload:
+        return None
+    if all(b == 0 for b in payload):
+        return ("ntag_blank", 1, ["All payload pages 4-15 are zero (factory state)"])
+    return None
+
+
+# Registered fingerprint detectors, in priority order (most-specific first)
+_FINGERPRINT_DETECTORS = (
+    _fp_vingcard_ul_ev1,
+    _fp_ndef_url,
+    _fp_blank_ultralight,
+)
+
+
+def detect_card_system(data: NFCCardData) -> None:
+    """Run all registered fingerprint detectors on `data` in order.
+
+    Sets data.system_fingerprint, data.security_score, and
+    data.fingerprint_evidence on first match. Mutates `data` in place.
+
+    No match means data.system_fingerprint stays None — interpreter falls
+    back to the generic family-level narrative.
+    """
+    for detector in _FINGERPRINT_DETECTORS:
+        try:
+            result = detector(data)
+        except Exception as e:
+            log.debug("fingerprint detector %s raised: %s — skipping",
+                      detector.__name__, e)
+            continue
+        if result is not None:
+            fp_id, score, evidence = result
+            data.system_fingerprint = fp_id
+            data.security_score = score
+            data.fingerprint_evidence = list(evidence)
+            log.info("fingerprint match: %s (score %d/5) with %d markers",
+                     fp_id, score, len(evidence))
+            return
+
+
 def parse_nfc_file(text: str, source_path: Optional[str] = None) -> NFCCardData:
     """Parse the Flipper firmware's .nfc text format into structured data.
 
@@ -157,8 +384,15 @@ def parse_nfc_file(text: str, source_path: Optional[str] = None) -> NFCCardData:
 
     Handles file format versions 2 and 4 transparently. Comment lines
     starting with '#' are skipped explicitly.
+
+    Captures pages (numbered 0..N), OTP, and Mifare version block so the
+    auto-detection rules in detect_card_system() have something to work on.
+    Calls detect_card_system() at the end to populate system_fingerprint.
     """
     data = NFCCardData(raw_text=text, source_path=source_path)
+    page_re = re.compile(r"^page\s+(\d+)$", re.IGNORECASE)
+    block_re = re.compile(r"^block\s+(\d+)$", re.IGNORECASE)
+
     for line in text.splitlines():
         stripped = line.lstrip()
         if not stripped or stripped.startswith("#"):
@@ -166,27 +400,49 @@ def parse_nfc_file(text: str, source_path: Optional[str] = None) -> NFCCardData:
         if ":" not in line:
             continue
         key, _, value = line.partition(":")
-        key = key.strip().lower()
+        key_lower = key.strip().lower()
         value = value.strip()
         if not value:
             continue
-        if key == "version":
-            # The .nfc FILE format version (2, 4, ...), not the firmware version
+        if key_lower == "version":
             data.file_format_version = value
-        elif key == "uid":
+        elif key_lower == "uid":
             data.uid = value
-        elif key == "atqa":
+        elif key_lower == "atqa":
             data.atqa = value
-        elif key == "sak":
+        elif key_lower == "sak":
             data.sak = value
-        elif key == "device type":
+        elif key_lower == "device type":
             data.device_type = value
-        elif key in (
+        elif key_lower in (
             "ntag/ultralight type",   # v4 NTAG/Ultralight subtype
-            "mifare classic type",    # v4 Mifare Classic subtype (1K vs 4K vs Plus)
-            "mifare desfire type",    # v4 DESFire subtype (EV1 vs EV2 vs EV3)
+            "mifare classic type",    # v4 Mifare Classic subtype
+            "mifare desfire type",    # v4 DESFire subtype
         ):
             data.subtype = value
+        elif key_lower == "mifare version":
+            data.mifare_version = value
+        else:
+            # Page captures: 'Page 0: 04 6D D7 36' (Ultralight family)
+            m = page_re.match(key.strip())
+            if m:
+                page_num = int(m.group(1))
+                data.pages[page_num] = value
+                # Page 3 IS the OTP region on UL family
+                if page_num == 3:
+                    data.otp = value
+                continue
+            # Block captures: 'Block 0: ...' (Mifare Classic family)
+            m = block_re.match(key.strip())
+            if m:
+                block_num = int(m.group(1))
+                # Reuse pages dict for blocks too — different families,
+                # consistent storage. Callers know to interpret by family.
+                data.pages[block_num] = value
+                continue
+
+    # Run auto-detection now that the data is fully populated
+    detect_card_system(data)
     return data
 
 
@@ -297,6 +553,9 @@ class RealNFCBackend:
                 "device_type": card.device_type,
                 "subtype": card.subtype,
                 "file_format_version": card.file_format_version,
+                "system_fingerprint": card.system_fingerprint,
+                "security_score": card.security_score,
+                "fingerprint_evidence": card.fingerprint_evidence,
                 "source_path": full_path,
             },
             tentative_id=tentative,
@@ -306,6 +565,9 @@ class RealNFCBackend:
                 + (f"; firmware labelled it {card.device_type!r}"
                    if card.device_type else "")
                 + (f" (subtype: {card.subtype!r})" if card.subtype else "")
+                + (f"; auto-detected as {card.system_fingerprint} "
+                   f"({card.security_score}/5 security)"
+                   if card.system_fingerprint else "")
             ),
         )
 

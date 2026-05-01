@@ -47,6 +47,21 @@ CATEGORY_KNOWLEDGE: dict[str, list[str]] = {
 }
 
 
+# Fingerprint-driven knowledge: when an event's outputs include a
+# system_fingerprint (set by detect_card_system in the parser), load the
+# matching vendor knowledge file ON TOP of the mission category files.
+# This is what makes "we've seen a Sandman keycard before" work — the
+# narrative pulls vingcard.md automatically without the operator asking.
+
+FINGERPRINT_KNOWLEDGE: dict[str, list[str]] = {
+    "vingcard_visionline_likely": ["vingcard"],
+    # Add new vendor fingerprints here as new knowledge files land.
+    # 'saflok_likely':    ['saflok'],
+    # 'salto_likely':     ['salto'],
+    # 'dormakaba_likely': ['dormakaba'],
+}
+
+
 # ---------- file resolution ----------------------------------------------
 
 _HERE = Path(__file__).parent
@@ -105,6 +120,30 @@ def _format_event_for_prompt(ev: dict[str, Any]) -> str:
     return json.dumps(keep, indent=2, default=str)
 
 
+def _harvest_fingerprints(events: list[dict[str, Any]]) -> list[str]:
+    """Walk events looking for system_fingerprint values to load extra
+    knowledge files for. Searches outputs.detection.raw, outputs.raw,
+    outputs.detections[*].raw."""
+    seen: list[str] = []
+    for ev in events:
+        outputs = ev.get("outputs") or {}
+
+        # Single-detection mission shape (nfc_capture etc.)
+        det = outputs.get("detection") or {}
+        raw = det.get("raw") or {}
+        fp = raw.get("system_fingerprint")
+        if fp and fp not in seen:
+            seen.append(fp)
+
+        # Multi-detection (triage) shape
+        for d in outputs.get("detections") or []:
+            r = (d or {}).get("raw") or {}
+            fp = r.get("system_fingerprint")
+            if fp and fp not in seen:
+                seen.append(fp)
+    return seen
+
+
 def build_prompt(
     events: list[dict[str, Any]],
     audience: str,
@@ -113,17 +152,26 @@ def build_prompt(
 ) -> str:
     """Assemble the full prompt for the chosen backend.
 
-    Returns a single string with three labelled sections:
-      [knowledge] -- field guides for the relevant categories
+    Returns a single string with four labelled sections:
+      [knowledge] -- field guides for the relevant categories AND any
+                     vendor fingerprints detected in the events
       [audience]  -- tone / length / what-to-include rules
       [events]    -- the actual data to interpret
       [task]      -- the specific ask
     """
-    # Determine which knowledge files to load. Use the first event's mission
-    # name. (Multi-event narratives across mission types are an edge case
-    # for v0.1 — single-mission events are the norm.)
+    # Mission-category knowledge (loaded by mission_name)
     primary_mission = events[0]["mission_name"] if events else "audit_smoketest"
     knowledge = _load_knowledge(primary_mission)
+
+    # Fingerprint-driven knowledge: vendor-specific files when the parser
+    # already auto-detected the system. Loaded on top of category knowledge.
+    for fp in _harvest_fingerprints(events):
+        for fname in FINGERPRINT_KNOWLEDGE.get(fp, []):
+            if fname not in knowledge:
+                content = _read_md(KNOWLEDGE_DIR / f"{fname}.md")
+                if content:
+                    knowledge[fname] = content
+
     audience_text = _load_audience(audience) or (
         f"# Audience: {audience}\n\n(no template found — using a neutral default tone)"
     )
@@ -152,7 +200,10 @@ def build_prompt(
         "drawing on the knowledge files. Lead with the answer. Cite specific "
         "values from the events (UID, ATQA/SAK, freq, protocol) so it's clearly "
         "this event being described, not a generic explanation. If the event "
-        "shows a failure, explain what went wrong in plain English."
+        "shows a failure, explain what went wrong in plain English. "
+        "If a system_fingerprint and security_score are present in the event, "
+        "include the 1-5 security rating in the narrative — operators find "
+        "this scale immediately useful."
     )
     if focus:
         parts.append(f"\nFocus on: {focus}.")

@@ -100,6 +100,44 @@ When the operator asks "should this system worry about a clone attack?":
 | DESFire EV1 with AES               | Not practical | Already good. Watch for downgrade attacks. |
 | DESFire EV2 with AES + diversification | No        | Best-in-class for commodity NFC  |
 
+## The 1-to-5 security scale (use this when explaining to operators)
+
+A simple, plain-English ranking the interpreter should reach for whenever
+the operator asks "how bad is this system?":
+
+- **1/5 — Insecure as designed.** Clone in seconds with $0 hardware.
+  Examples: bare-UID check on Mifare Classic with default keys; old
+  Onity magstripe; EM4100 RFID badges with no facility code check.
+
+- **2/5 — Cloneable in minutes.** Public attack tools exist, $30 hardware,
+  no special knowledge needed. Examples: Mifare Classic with non-default
+  keys (mfkey32); HID Prox without facility code rotation.
+
+- **3/5 — Public attack exists, but requires effort.** Multi-step attack,
+  often needing access to both a card and a reader. Tools exist publicly
+  but aren't push-button. Examples: VingCard UL EV1 (Unsaflok),
+  HID iCLASS Standard, Mifare Plus in SL1 mode.
+
+- **4/5 — Theoretical only / not practical today.** No public push-button
+  exploit. Attacks require a lab and weeks of work, or rely on side
+  channels not feasible in the wild. Examples: DESFire EV1 with AES,
+  HID iCLASS Elite (without leaked HID Master Key), Seos with proper
+  diversification.
+
+- **5/5 — No known public attack.** Cryptographically sound, properly
+  deployed, key diversification per-card, no leaked master keys.
+  Examples: DESFire EV2/EV3 with AES + diversification + secure
+  encoder; modern federal / military access systems.
+
+When grading a system, the interpreter should:
+1. Identify the family (Classic / Plus / DESFire / Ultralight family / etc.)
+2. Identify the deployment specifics (default keys? PWD? diversification?)
+3. Pick the level. Be honest. Don't grade up because the customer "feels
+   safe" or down because "everything is broken eventually."
+4. Include the specific public attack name when relevant (mfkey32,
+   hardnested, Unsaflok, HID Master Key leak, etc.) so the operator
+   can look it up.
+
 ## Region notes
 
 NFC works the same globally — no regional frequency differences (13.56 MHz
