@@ -33,6 +33,7 @@ log = logging.getLogger("llmdr_redteam.interpreter")
 CATEGORY_KNOWLEDGE: dict[str, list[str]] = {
     "audit_smoketest":     ["nfc"],     # smoketest pretends to be NFC
     "unknown_identify":    ["triage", "nfc", "rfid", "subghz", "ir"],
+    "nfc_capture":         ["nfc"],
     "nfc_clone":           ["nfc"],
     "nfc_emulate":         ["nfc"],
     "nfc_mfkey32":         ["nfc"],
