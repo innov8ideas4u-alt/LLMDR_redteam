@@ -38,6 +38,17 @@ class CanonicalizeError(ValueError):
 NFC_UID = "nfc_uid"               # ISO14443 / 15693 — variable-length hex
 RFID_EM4100 = "rfid_em4100"       # 125 kHz EM4100 — 5 bytes
 RFID_T5577 = "rfid_t5577"         # 125 kHz T5577 — page-0 hash, 8 bytes
+RFID_HID_PROX = "rfid_hid_prox"   # 125 kHz HID Prox / H10301 — variable bytes
+                                   # (26-bit, 35-bit, 37-bit Wiegand variants
+                                   # all fold into hex of varying length)
+RFID_INDALA = "rfid_indala"       # 125 kHz Indala (26-bit, 224-bit) — variable
+RFID_AWID = "rfid_awid"           # 125 kHz AWID — variable
+RFID_GENERIC = "rfid_generic"     # 125 kHz family we recognized at the firmware
+                                   # level but don't have a dedicated handler for
+                                   # yet (Pyramid, Viking, Jablotron, Paradox,
+                                   # IoProx, Nexwatch, Securakey, Gallagher,
+                                   # FDX-A/B animal IDs, raw T5577 reads).
+                                   # Variable-length hex.
 IBUTTON = "ibutton"               # Dallas/1-wire — 8 bytes
 SUBGHZ_SIGNAL = "subghz_signal"   # (freq_hz, modulation, protocol)
 IR_PROTOCOL = "ir_protocol"       # (protocol, address, command)
@@ -47,6 +58,10 @@ SUPPORTED_TYPES = frozenset({
     NFC_UID,
     RFID_EM4100,
     RFID_T5577,
+    RFID_HID_PROX,
+    RFID_INDALA,
+    RFID_AWID,
+    RFID_GENERIC,
     IBUTTON,
     SUBGHZ_SIGNAL,
     IR_PROTOCOL,
@@ -225,6 +240,20 @@ def canonicalize_cross_link(link_type: str, raw: Any) -> dict:
         value = _normalize_hex(raw, expected_bytes=5, type_label="rfid_em4100")
     elif link_type == RFID_T5577:
         value = _normalize_hex(raw, expected_bytes=8, type_label="rfid_t5577")
+    elif link_type == RFID_HID_PROX:
+        # HID Prox variants (26-bit, 35-bit, 37-bit Wiegand) all serialize
+        # to even-byte hex but at different lengths. Don't enforce length
+        # — let the family fingerprint downstream interpret the bits.
+        value = _normalize_hex(raw, type_label="rfid_hid_prox")
+    elif link_type == RFID_INDALA:
+        value = _normalize_hex(raw, type_label="rfid_indala")
+    elif link_type == RFID_AWID:
+        value = _normalize_hex(raw, type_label="rfid_awid")
+    elif link_type == RFID_GENERIC:
+        # Catch-all bucket for 125 kHz protocols without dedicated handlers
+        # yet. Cross-links to other generic-bucket events of the same hex
+        # value still work — just less specific than a typed link.
+        value = _normalize_hex(raw, type_label="rfid_generic")
     elif link_type == IBUTTON:
         value = _normalize_hex(raw, expected_bytes=8, type_label="ibutton")
     elif link_type == SUBGHZ_SIGNAL:
