@@ -36,7 +36,7 @@ CATEGORY_KNOWLEDGE: dict[str, list[str]] = {
     "nfc_capture":         ["nfc"],
     "nfc_clone":           ["nfc"],
     "nfc_emulate":         ["nfc"],
-    "nfc_mfkey32":         ["nfc"],
+    "nfc_mfkey32":         ["nfc", "mfkey32"],
     "rfid_clone":          ["rfid"],
     "rfid_brute":          ["rfid"],
     "subghz_replay":       ["subghz"],
